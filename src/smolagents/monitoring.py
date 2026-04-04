@@ -37,10 +37,25 @@ __all__ = ["AgentLogger", "LogLevel", "Monitor", "TokenUsage", "Timing"]
 class TokenUsage:
     """
     Contains the token usage information for a given step or run.
+
+    All providers are normalized to OpenAI-style semantics: ``input_tokens`` is the
+    **total** prompt token count (including any cached tokens), and
+    ``cache_read_input_tokens`` / ``cache_creation_input_tokens`` are breakdowns
+    (subsets) of that total.
+
+    Attributes:
+        input_tokens: Total number of input (prompt) tokens, including cached tokens.
+        output_tokens: Number of output (completion) tokens.
+        cache_read_input_tokens: Number of input tokens served from the prompt cache
+            (subset of ``input_tokens``).
+        cache_creation_input_tokens: Number of input tokens written into the prompt
+            cache (subset of ``input_tokens``; Anthropic only).
     """
 
     input_tokens: int
     output_tokens: int
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
     total_tokens: int = field(init=False)
 
     def __post_init__(self):
@@ -50,6 +65,8 @@ class TokenUsage:
         return {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+            "cache_creation_input_tokens": self.cache_creation_input_tokens,
             "total_tokens": self.total_tokens,
         }
 
@@ -85,17 +102,23 @@ class Monitor:
         self.logger = logger
         self.total_input_token_count = 0
         self.total_output_token_count = 0
+        self.total_cache_read_input_token_count = 0
+        self.total_cache_creation_input_token_count = 0
 
     def get_total_token_counts(self) -> TokenUsage:
         return TokenUsage(
             input_tokens=self.total_input_token_count,
             output_tokens=self.total_output_token_count,
+            cache_read_input_tokens=self.total_cache_read_input_token_count,
+            cache_creation_input_tokens=self.total_cache_creation_input_token_count,
         )
 
     def reset(self):
         self.step_durations = []
         self.total_input_token_count = 0
         self.total_output_token_count = 0
+        self.total_cache_read_input_token_count = 0
+        self.total_cache_creation_input_token_count = 0
 
     def update_metrics(self, step_log):
         """Update the metrics of the monitor.
@@ -110,9 +133,16 @@ class Monitor:
         if step_log.token_usage is not None:
             self.total_input_token_count += step_log.token_usage.input_tokens
             self.total_output_token_count += step_log.token_usage.output_tokens
+            self.total_cache_read_input_token_count += step_log.token_usage.cache_read_input_tokens
+            self.total_cache_creation_input_token_count += step_log.token_usage.cache_creation_input_tokens
             console_outputs += (
                 f"| Input tokens: {self.total_input_token_count:,} | Output tokens: {self.total_output_token_count:,}"
             )
+            if self.total_cache_read_input_token_count > 0 or self.total_cache_creation_input_token_count > 0:
+                console_outputs += (
+                    f" | Cache read: {self.total_cache_read_input_token_count:,}"
+                    f" | Cache creation: {self.total_cache_creation_input_token_count:,}"
+                )
         console_outputs += "]"
         self.logger.log(Text(console_outputs, style="dim"), level=1)
 

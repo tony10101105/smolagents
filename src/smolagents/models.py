@@ -227,10 +227,14 @@ def agglomerate_stream_deltas(
     accumulated_content = ""
     total_input_tokens = 0
     total_output_tokens = 0
+    total_cache_read_input_tokens = 0
+    total_cache_creation_input_tokens = 0
     for stream_delta in stream_deltas:
         if stream_delta.token_usage:
             total_input_tokens += stream_delta.token_usage.input_tokens
             total_output_tokens += stream_delta.token_usage.output_tokens
+            total_cache_read_input_tokens += stream_delta.token_usage.cache_read_input_tokens
+            total_cache_creation_input_tokens += stream_delta.token_usage.cache_creation_input_tokens
         if stream_delta.content:
             accumulated_content += stream_delta.content
         if stream_delta.tool_calls:
@@ -275,6 +279,8 @@ def agglomerate_stream_deltas(
         token_usage=TokenUsage(
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
+            cache_read_input_tokens=total_cache_read_input_tokens,
+            cache_creation_input_tokens=total_cache_creation_input_tokens,
         ),
     )
 
@@ -1217,6 +1223,11 @@ class LiteLLMModel(ApiModel):
             Useful for specific models that do not support specific message roles like "system".
         flatten_messages_as_text (`bool`, *optional*): Whether to flatten messages as text.
             Defaults to `True` for models that start with "ollama", "groq", "cerebras".
+        prompt_cache (`bool`, default `False`):
+            Whether to enable prompt caching. When enabled, ``cache_control`` markers are
+            injected into the system prompt and the last user turn so that providers like
+            Anthropic can cache prefix tokens.  LiteLLM silently strips unknown fields for
+            providers that do not support caching, so this is safe to enable universally.
         **kwargs:
             Additional keyword arguments to forward to the underlying LiteLLM completion call.
     """
@@ -1228,6 +1239,7 @@ class LiteLLMModel(ApiModel):
         api_key: str | None = None,
         custom_role_conversions: dict[str, str] | None = None,
         flatten_messages_as_text: bool | None = None,
+        prompt_cache: bool = False,
         **kwargs,
     ):
         if not model_id:
@@ -1240,6 +1252,7 @@ class LiteLLMModel(ApiModel):
             model_id = "anthropic/claude-3-5-sonnet-20240620"
         self.api_base = api_base
         self.api_key = api_key
+        self.prompt_cache = prompt_cache
         flatten_messages_as_text = (
             flatten_messages_as_text
             if flatten_messages_as_text is not None
@@ -1263,6 +1276,63 @@ class LiteLLMModel(ApiModel):
 
         return litellm
 
+    @staticmethod
+    def _add_cache_control(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Add ``cache_control`` markers to messages for prompt caching.
+
+        Marks the system message and the last user message with
+        ``{"cache_control": {"type": "ephemeral"}}`` so that providers like
+        Anthropic can cache the prefix.  The last user message is cached
+        because it will become part of the prefix in the next agent step.
+        LiteLLM silently strips unknown fields for non-supporting providers.
+        """
+        # Mark system message(s)
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg["content"]
+                if isinstance(content, list) and len(content) > 0:
+                    content[-1]["cache_control"] = {"type": "ephemeral"}
+                elif isinstance(content, str):
+                    msg["content"] = [
+                        {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+                    ]
+
+        # Mark the last user message so its content is cached for the next
+        # agent step, where it will be part of the conversation prefix.
+        user_indices = [i for i, msg in enumerate(messages) if msg.get("role") == "user"]
+        if user_indices:
+            target = messages[user_indices[-1]]
+            content = target["content"]
+            if isinstance(content, list) and len(content) > 0:
+                content[-1]["cache_control"] = {"type": "ephemeral"}
+            elif isinstance(content, str):
+                target["content"] = [
+                    {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+                ]
+
+        return messages
+
+    @staticmethod
+    def _extract_cache_usage(usage) -> dict[str, int]:
+        """Extract prompt-cache token counts from an API usage object.
+
+        Returns a dict with ``cache_read_input_tokens`` and
+        ``cache_creation_input_tokens`` (defaulting to 0).
+        """
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+
+        # OpenAI-style: prompt_tokens_details.cached_tokens
+        if cache_read == 0:
+            details = getattr(usage, "prompt_tokens_details", None)
+            if details is not None:
+                cache_read = getattr(details, "cached_tokens", 0) or 0
+
+        return {
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_creation,
+        }
+
     def generate(
         self,
         messages: list[ChatMessage | dict],
@@ -1283,6 +1353,8 @@ class LiteLLMModel(ApiModel):
             custom_role_conversions=self.custom_role_conversions,
             **kwargs,
         )
+        if self.prompt_cache:
+            completion_kwargs["messages"] = self._add_cache_control(completion_kwargs["messages"])
         self._apply_rate_limit()
         response = self.retryer(self.client.completion, **completion_kwargs)
 
@@ -1295,6 +1367,7 @@ class LiteLLMModel(ApiModel):
         content = response.choices[0].message.content
         if stop_sequences is not None and not self.supports_stop_parameter:
             content = remove_content_after_stop_sequences(content, stop_sequences)
+        cache_usage = self._extract_cache_usage(response.usage)
         return ChatMessage(
             role=response.choices[0].message.role,
             content=content,
@@ -1303,6 +1376,7 @@ class LiteLLMModel(ApiModel):
             token_usage=TokenUsage(
                 input_tokens=response.usage.prompt_tokens,
                 output_tokens=response.usage.completion_tokens,
+                **cache_usage,
             ),
         )
 
@@ -1326,16 +1400,20 @@ class LiteLLMModel(ApiModel):
             convert_images_to_image_urls=True,
             **kwargs,
         )
+        if self.prompt_cache:
+            completion_kwargs["messages"] = self._add_cache_control(completion_kwargs["messages"])
         self._apply_rate_limit()
         for event in self.retryer(
             self.client.completion, **completion_kwargs, stream=True, stream_options={"include_usage": True}
         ):
             if getattr(event, "usage", None):
+                cache_usage = self._extract_cache_usage(event.usage)
                 yield ChatMessageStreamDelta(
                     content="",
                     token_usage=TokenUsage(
                         input_tokens=event.usage.prompt_tokens,
                         output_tokens=event.usage.completion_tokens,
+                        **cache_usage,
                     ),
                 )
             if event.choices:
@@ -1643,6 +1721,21 @@ class InferenceClientModel(ApiModel):
                         raise ValueError(f"No content or tool calls in event: {event}")
 
 
+def _extract_cache_usage_from_openai(usage) -> dict[str, int]:
+    """Extract prompt-cache token counts from an OpenAI-style usage object.
+
+    OpenAI reports cached tokens under ``prompt_tokens_details.cached_tokens``.
+    """
+    cache_read = 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is not None:
+        cache_read = getattr(details, "cached_tokens", 0) or 0
+    return {
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": 0,
+    }
+
+
 class OpenAIModel(ApiModel):
     """This model connects to an OpenAI-compatible API server.
 
@@ -1730,11 +1823,13 @@ class OpenAIModel(ApiModel):
             stream_options={"include_usage": True},
         ):
             if event.usage:
+                cache_usage = _extract_cache_usage_from_openai(event.usage)
                 yield ChatMessageStreamDelta(
                     content="",
                     token_usage=TokenUsage(
                         input_tokens=event.usage.prompt_tokens,
                         output_tokens=event.usage.completion_tokens,
+                        **cache_usage,
                     ),
                 )
             if event.choices:
@@ -1781,6 +1876,7 @@ class OpenAIModel(ApiModel):
         content = response.choices[0].message.content
         if stop_sequences is not None and not self.supports_stop_parameter:
             content = remove_content_after_stop_sequences(content, stop_sequences)
+        cache_usage = _extract_cache_usage_from_openai(response.usage)
         return ChatMessage(
             role=response.choices[0].message.role,
             content=content,
@@ -1789,6 +1885,7 @@ class OpenAIModel(ApiModel):
             token_usage=TokenUsage(
                 input_tokens=response.usage.prompt_tokens,
                 output_tokens=response.usage.completion_tokens,
+                **cache_usage,
             ),
         )
 
